@@ -95,7 +95,7 @@ fn main() {
 
     endable.add(motor.clone());
 
-    let config = MLX90393Config::new(0x30, pins.gpio8.into(), pins.gpio9.into());
+    let config = MLX90393Config::new(0x0C, pins.gpio8.into(), pins.gpio9.into());
     
     let mag = match MLX90393::new(peripherals.i2c0, config) {
         Ok(mag) => Arc::new(Mutex::new(mag)),
@@ -107,11 +107,11 @@ fn main() {
 
     endable.add(mag.clone());
 
-    /*if let Err(error) = configure_mag(mag.clone()) {
+    if let Err(error) = configure_mag(mag.clone()) {
         log::error!("Error configuring magnetometer: {}", error);
         halt_system(&mut endable);
         return;
-    }*/
+    }
     
     if let Err(err) = setup_bt_server(parameters.clone()) {
         log::error!("Error setting up advertisement: {}", err);
@@ -127,7 +127,35 @@ fn main() {
     }
 
     loop {
-        if let Err(e) = motor.lock().unwrap().set_angle(0) {
+        if let Err(e) = mag.lock().unwrap().start_single_measurement() {
+            log::error!("Error starting single measurement: {}", e);
+        }
+        thread::sleep(std::time::Duration::from_millis(1000));
+        match mag.lock().unwrap().read_measurement() {
+            Ok(measurement) => {
+                log::debug!("Measurement: {:?}", measurement);
+                let x = measurement[0];
+                let y = measurement[1];
+                //let z = measurement[2];
+                
+                let mut heading =  (y.atan2(x) * 180.0) / std::f32::consts::PI;
+                log::debug!("Heading 1: {}", heading);
+                heading = heading.abs();
+                log::debug!("Heading 2: {}", heading);
+                if heading > 180.0 {
+                    heading = heading - 180.0;
+                }
+                log::debug!("Heading 3: {}", heading);
+
+                if let Err(e) = motor.lock().unwrap().set_angle(heading as i32) {
+                    log::error!("Error sending message: {}", e);
+                }
+            }
+            Err(e) => log::error!("Error reading measurement: {}", e),
+        }
+        thread::sleep(std::time::Duration::from_millis(1000));
+
+        /*if let Err(e) = motor.lock().unwrap().set_angle(0) {
             log::error!("Error sending message: {}", e);
         }
         thread::sleep(std::time::Duration::from_secs(60));
@@ -139,11 +167,12 @@ fn main() {
             log::error!("Error sending message: {}", e);
         }
         thread::sleep(std::time::Duration::from_secs(60));
+        
         let angle = rand::thread_rng().gen_range(0..181);
         if let Err(e) = motor.lock().unwrap().set_angle(angle) {
             log::error!("Error sending message: {}", e);
         }
-        thread::sleep(std::time::Duration::from_secs(60));
+        thread::sleep(std::time::Duration::from_secs(60));*/
     }
 }
 

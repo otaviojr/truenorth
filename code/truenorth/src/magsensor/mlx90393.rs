@@ -6,6 +6,52 @@ use esp_idf_hal::{gpio::AnyIOPin, i2c::{I2c, I2cDriver}, peripheral::Peripheral,
 
 use crate::{magsensor::MagSensor, Endable};
 
+    // HALLCONF - 0x00
+    // is the same table applying a scale factor of 98/75
+const GAIN_RES_CONVERSION: [[(f32, f32); 8];4] = [
+    // HALLCONF - 0xC
+    [
+        (0.751, 1.210),
+        (0.601, 0.968),
+        (0.451, 0.726),
+        (0.376, 0.605),
+        (0.300, 0.484),
+        (0.250, 0.403),
+        (0.200, 0.323),
+        (0.150, 0.242),
+    ],
+    [
+        (1.502, 2.420),
+        (1.202, 1.936),
+        (0.901, 1.452),
+        (0.751, 1.210),
+        (0.601, 0.968),
+        (0.501, 0.807),
+        (0.401, 0.645),
+        (0.300, 0.484),
+    ],
+    [
+        (3.004, 4.840),
+        (2.403, 3.872),
+        (1.803, 2.904),
+        (1.502, 2.420),
+        (1.202, 1.936),
+        (1.001, 1.613),
+        (0.801, 1.291),
+        (0.601, 0.968),
+    ],
+    [
+        (6.009, 9.680),
+        (4.840, 7.744),
+        (3.605, 5.808),
+        (3.004, 4.840),
+        (2.403, 3.872),
+        (2.003, 3.227),
+        (1.602, 2.581),
+        (1.202, 1.936),
+    ],
+];
+
 
 #[derive(Debug)]
 pub enum MLX90393REG {
@@ -61,15 +107,16 @@ impl From<u8> for MLX90393CMD {
 }
 
 
+#[derive(Debug, Clone, Copy)]
 pub enum MLX90393GAIN {
     GAIN5X = (0x00),
-    GAIN4X,
-    GAIN3X,
-    GAIN2_5X,
-    GAIN2X,
-    GAIN1_67X,
-    GAIN1_33X,
-    GAIN1X
+    GAIN4X = (0x01),
+    GAIN3X = (0x02),
+    GAIN2_5X = (0x03),
+    GAIN2X = (0x04),
+    GAIN1_67X = (0x05),
+    GAIN1_33X = (0x06),
+    GAIN1X = (0x07),
 }
 
 impl From<MLX90393GAIN> for u8 {
@@ -94,11 +141,12 @@ impl From<u8> for MLX90393GAIN {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum MLX90393RESOLUTION {
-    RES16,
-    RES17,
-    RES18,
-    RES19,
+    RES16 = (0x00),
+    RES17 = (0x01),
+    RES18 = (0x02),
+    RES19 = (0x03),
 }
 
 impl From<MLX90393RESOLUTION> for u8 {
@@ -145,6 +193,7 @@ impl From<u8> for MLX90393AXIS {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum MLX90393FILTER {
     FILTER0,
     FILTER1,
@@ -178,6 +227,7 @@ impl From<u8> for MLX90393FILTER {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum MLX90393OVERSAMPLING {
     OSR0,
     OSR1,
@@ -221,6 +271,10 @@ pub struct MLX90393<'a> {
     slave_address: u8,
     tx_end: Sender<bool>,
     rx_end: Arc<Mutex<Receiver<bool>>>,
+    current_gain: Option<MLX90393GAIN>,
+    current_resolution: Option<u16>,
+    current_filter: Option<MLX90393FILTER>,
+    current_oversampling: Option<MLX90393OVERSAMPLING>,
 }
 
 impl<'a> MLX90393<'a> {
@@ -228,7 +282,15 @@ impl<'a> MLX90393<'a> {
     pub fn new(i2c: impl Peripheral<P = impl I2c> + 'a, config: Arc<Mutex<MLX90393Config>>) -> Result<Self, Box<dyn std::error::Error>> {
         let (tx_end, rx_end) = mpsc::channel::<bool>();
         let i2c = Self::init_i2c(i2c, config.clone())?;
-        let me = Self { i2c: Some(i2c), slave_address: config.lock().unwrap().slave_address, tx_end, rx_end: Arc::new(Mutex::new(rx_end)) };
+        let me = Self { 
+            i2c: Some(i2c), 
+            slave_address: config.lock().unwrap().slave_address, 
+            tx_end, 
+            rx_end: Arc::new(Mutex::new(rx_end)), 
+            current_gain: None, 
+            current_resolution: None, 
+            current_filter: None, 
+            current_oversampling: None };
         me.init()?;
         Ok(me)
     }
@@ -278,6 +340,47 @@ impl<'a> MLX90393<'a> {
         Ok(())
     }
 
+
+    #[allow(dead_code)]
+    pub fn read_measurement(&mut self) -> Result<[f32; 3], Box<dyn std::error::Error>> {
+        let tx_buf: [u8; 1] = [MLX90393CMD::RM as u8 | MLX90393AXIS::ALL as u8];
+        let mut rx_buf: [u8; 9] = [0; 9];
+
+        self.i2c.as_mut().unwrap().write(self.slave_address, &tx_buf, BLOCK)?;
+        thread::sleep(Duration::from_millis(10));
+        self.i2c.as_mut().unwrap().read(self.slave_address, &mut rx_buf, BLOCK)?;
+
+        let status = rx_buf[0];
+        let error = status & 0x10;
+        let val = [
+            (rx_buf[3] as i16) << 8 | rx_buf[4] as i16,
+            (rx_buf[5] as i16) << 8 | rx_buf[6] as i16,
+            (rx_buf[7] as i16) << 8 | rx_buf[8] as i16,
+        ];
+
+        let gain = self.get_gain()?;
+        let x_resolution = self.get_resolution(MLX90393AXIS::X)?;
+        let y_resolution = self.get_resolution(MLX90393AXIS::Y)?;
+        let z_resolution = self.get_resolution(MLX90393AXIS::Z)?;
+
+        log::debug!("Gain: {:?}", gain);
+        log::debug!("X resolution: {:?}", x_resolution);
+        log::debug!("Y resolution: {:?}", y_resolution);
+        log::debug!("Z resolution: {:?}", z_resolution);
+
+        let ret = [
+            val[0] as f32 * GAIN_RES_CONVERSION[x_resolution as usize][gain as usize].0,
+            val[1] as f32 * GAIN_RES_CONVERSION[y_resolution as usize][gain as usize].0,
+            val[2] as f32 * GAIN_RES_CONVERSION[z_resolution as usize][gain as usize].1,
+        ];
+
+        if error != 0 {
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("MLX90393: read_measurement failed, status: {}", status))));
+        }
+
+        Ok(ret)
+    }
+
     #[allow(dead_code)]
     pub fn set_gain(&mut self, new_gain: MLX90393GAIN) -> Result<(), Box<dyn std::error::Error>> {
         let mut gain = self.read_register(MLX90393REG::CONF1)?;
@@ -286,11 +389,18 @@ impl<'a> MLX90393<'a> {
 
         self.write_register(MLX90393REG::CONF1, gain)?;
 
+        self.current_gain = Some(new_gain);
+
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_gain(&mut self) -> Result<MLX90393GAIN, Box<dyn std::error::Error>> {
+
+        if self.current_gain.is_some() {
+            return Ok(self.current_gain.unwrap());
+        }
+
         let mut gain = self.read_register(MLX90393REG::CONF1)?;
         gain &= 0x0070;
 
@@ -319,12 +429,20 @@ impl<'a> MLX90393<'a> {
 
         self.write_register(MLX90393REG::CONF3, resolution)?;
 
+        self.current_resolution = Some(resolution);
+
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_resolution(&mut self, axis: MLX90393AXIS) -> Result<MLX90393RESOLUTION, Box<dyn std::error::Error>> {
-        let resolution = self.read_register(MLX90393REG::CONF3)?;
+
+        let resolution = if self.current_resolution.is_some() {
+            self.current_resolution.unwrap()
+        } else {
+            self.read_register(MLX90393REG::CONF3)?
+        };
+
         Ok(MLX90393RESOLUTION::from(match axis {
             MLX90393AXIS::X => (((resolution & 0x0060) >> 5) & 0x03) as u8,
             MLX90393AXIS::Y => (((resolution & 0x0180) >> 7) & 0x03) as u8,
@@ -339,11 +457,17 @@ impl<'a> MLX90393<'a> {
         filter &= !0x1C;
         filter |= (new_filter as u16) << 2;
         self.write_register(MLX90393REG::CONF3, filter)?;
+
+        self.current_filter = Some(new_filter);
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_filter(&mut self) -> Result<MLX90393FILTER, Box<dyn std::error::Error>> {
+        if self.current_filter.is_some() {
+            return Ok(self.current_filter.unwrap());
+        }
+
         let filter = self.read_register(MLX90393REG::CONF3)?;
         Ok(MLX90393FILTER::from(((filter & 0x1C) >> 2) as u8))
     }
@@ -354,11 +478,17 @@ impl<'a> MLX90393<'a> {
         oversampling &= !0x03;
         oversampling |= new_oversampling as u16;
         self.write_register(MLX90393REG::CONF3, oversampling)?;
+
+        self.current_oversampling = Some(new_oversampling);
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_oversampling(&mut self) -> Result<MLX90393OVERSAMPLING, Box<dyn std::error::Error>> {
+        if self.current_oversampling.is_some() {
+            return Ok(self.current_oversampling.unwrap());
+        }
+
         let oversampling = self.read_register(MLX90393REG::CONF3)?;
         Ok(MLX90393OVERSAMPLING::from((oversampling & 0x03) as u8))
     }
@@ -371,6 +501,7 @@ impl<'a> MLX90393<'a> {
             trigger |= 0x8000;
         }
         self.write_register(MLX90393REG::CONF2, trigger)?;
+
         Ok(())
     }
 
@@ -467,11 +598,14 @@ impl<'a> MLX90393<'a> {
 
     fn init(&self) -> Result<(), Box<dyn std::error::Error>> {
         let rx_end = self.rx_end.clone();
-        
+
         thread::Builder::new().stack_size(1024 * 20).spawn(move || {
             let executor = LocalExecutor::new();
 
-            async fn sensor_thread(_executor: &LocalExecutor<'_>, rx_end: Arc<Mutex<Receiver<bool>>>) -> Result<(), Box<dyn std::error::Error>> {
+            async fn sensor_thread(
+                _executor: &LocalExecutor<'_>,
+                rx_end: Arc<Mutex<Receiver<bool>>>
+            ) -> Result<(), Box<dyn std::error::Error>> {
                 loop {
                     if let Ok(end) = rx_end.lock().unwrap().try_recv() {
                         if end {
@@ -484,7 +618,7 @@ impl<'a> MLX90393<'a> {
                 Ok(())
             }
     
-            let fut = &mut pin!(sensor_thread(&executor, rx_end));
+            let fut = &mut pin!(sensor_thread(&executor, rx_end.clone()));
     
             if let Err(e) = async_io::block_on(executor.run(fut)) {
                 log::error!("Error MLX90393 thread: {}", e);

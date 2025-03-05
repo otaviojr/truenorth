@@ -3,28 +3,30 @@
 pub mod motor;
 pub mod smartvar;
 pub mod magsensor;
+use crate::motor::Motor;
+use crate::smartvar::SmartVar;
 
-use async_executor::LocalExecutor;
-use esp32_nimble::utilities::BleUuid;
-use esp32_nimble::NimbleProperties;
-use magsensor::mlx90393::{MLX90393Config, MLX90393AXIS, MLX90393FILTER, MLX90393GAIN, MLX90393OVERSAMPLING, MLX90393RESOLUTION};
 use std::any::Any;
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::thread;
-use rand::Rng;
+//use rand::Rng;
 use std::sync::Mutex;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::pin::pin;
 use async_io;
-use esp_idf_svc::hal::prelude::*;
+use async_executor::LocalExecutor;
+
+use esp32_nimble::utilities::BleUuid;
+use esp32_nimble::NimbleProperties;
 use esp32_nimble::{BLEDevice, BLEAdvertisementData, BLECharacteristic, enums::{ConnMode, DiscMode, AuthReq, SecurityIOCap}};
+use esp_idf_svc::hal::gpio::{PinDriver, Pull, InterruptType};
+use esp_idf_svc::hal::task::notification::Notification;
+use esp_idf_svc::hal::prelude::*;
 
-use crate::motor::Motor;
-use crate::smartvar::SmartVar;
-
-use crate::magsensor::mlx90393::MLX90393;
-
+use magsensor::mlx90393::MLX90393Config;
+use magsensor::mlx90393::MLX90393;
 thread_local! {
     #[allow(clippy::thread_local_initializer_can_be_made_const)]
     static TAG_NAMESPACE:RefCell<&'static str> =  RefCell::new("truenorth");
@@ -104,14 +106,6 @@ fn main() {
             return;
         }
     };
-
-    endable.add(mag.clone());
-
-    if let Err(error) = configure_mag(mag.clone()) {
-        log::error!("Error configuring magnetometer: {}", error);
-        halt_system(&mut endable);
-        return;
-    }
     
     if let Err(err) = setup_bt_server(parameters.clone()) {
         log::error!("Error setting up advertisement: {}", err);
@@ -126,11 +120,42 @@ fn main() {
         log::error!("Error setting up declination storage: {}", err);
     }
 
-    loop {
-        if let Err(e) = mag.lock().unwrap().start_single_measurement() {
-            log::error!("Error starting single measurement: {}", e);
+    /*
+     * Setup interruption for burst mode
+     */
+    let mut interrupt_pin = {
+        if let Ok(iopin) = PinDriver::input(pins.gpio1) {
+            iopin
+        } else {
+            log::error!("Error setting up interruption");
+            return;
         }
-        thread::sleep(std::time::Duration::from_millis(1000));
+    };
+
+    interrupt_pin.set_pull(Pull::Down).unwrap();
+    interrupt_pin.set_interrupt_type(InterruptType::PosEdge).unwrap();
+
+    let notification = Notification::new();
+    let waker = notification.notifier();
+
+    unsafe {
+        interrupt_pin
+            .subscribe_nonstatic(move || {
+                waker.notify(NonZero::new(1).unwrap());
+            })
+            .unwrap();
+    }
+
+    loop {
+
+        if let Err(e) = interrupt_pin.enable_interrupt() {
+            log::error!("Error enabling interrupt: {}", e);
+        }
+
+        notification.wait_any();
+
+        log::debug!("Interrupt received");
+
         match mag.lock().unwrap().read_measurement() {
             Ok(measurement) => {
                 log::debug!("Measurement: {:?}", measurement);
@@ -153,7 +178,12 @@ fn main() {
             }
             Err(e) => log::error!("Error reading measurement: {}", e),
         }
-        thread::sleep(std::time::Duration::from_millis(1000));
+
+        //if let Err(e) = mag.lock().unwrap().start_single_measurement() {
+        //    log::error!("Error starting single measurement: {}", e);
+        //}
+
+        /*thread::sleep(std::time::Duration::from_millis(1000));*/
 
         /*if let Err(e) = motor.lock().unwrap().set_angle(0) {
             log::error!("Error sending message: {}", e);
@@ -181,20 +211,8 @@ fn halt_system(endable: &mut EndableHandler) {
     log::error!("Halting system");
     endable.end_all();
     loop {
-        thread::sleep(std::time::Duration::from_secs(60));
+        thread::sleep(std::time::Duration::from_secs(1));
     }
-}
-
-#[allow(unused)]
-fn configure_mag(mag: Arc<Mutex<MLX90393>>) -> Result<(), Box<dyn std::error::Error>> {
-    mag.lock().unwrap().set_gain(MLX90393GAIN::GAIN1X)?;
-    mag.lock().unwrap().set_resolution(MLX90393AXIS::X, MLX90393RESOLUTION::RES17)?;
-    mag.lock().unwrap().set_resolution(MLX90393AXIS::Y, MLX90393RESOLUTION::RES17)?;
-    mag.lock().unwrap().set_resolution(MLX90393AXIS::Z, MLX90393RESOLUTION::RES16)?;
-    mag.lock().unwrap().set_oversampling(MLX90393OVERSAMPLING::OSR3)?;
-    mag.lock().unwrap().set_filter(MLX90393FILTER::FILTER5)?;
-
-    Ok(()) 
 }
 
 fn setup_bt_server(parameters: Arc<TrueNorthParameters>) -> Result<(), Box<dyn std::error::Error>> {

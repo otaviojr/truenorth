@@ -1,23 +1,26 @@
 
-use std::{pin::pin, sync::{Arc, Mutex}, thread};
+use std::{num::NonZero, pin::pin, sync::{Arc, Mutex}, thread};
 
 use async_executor::LocalExecutor;
-use esp_idf_hal::{gpio::AnyIOPin, i2c::{I2c, I2cDriver}, peripheral::Peripheral, units::Hertz};
+use esp_idf_svc::hal::{gpio::{AnyIOPin, PinDriver, Pull, InterruptType}, i2c::{I2c, I2cDriver}, peripheral::Peripheral, units::Hertz};
+use esp_idf_svc::hal::task::notification::Notification;
 
-use crate::magsensor::MagSensor;
+
+use crate::{magsensor::MagSensor, TrueNorthParameters};
 use crate::magsensor::mlx90393_defs::*;
 use crate::magsensor::mlx90393_inner::MLX90393Inner;
 
-  
 pub struct MLX90393Config {
     slave_address: u8,
     sda: AnyIOPin,
     scl: AnyIOPin,
+    int: AnyIOPin,
+    parameters: Arc<TrueNorthParameters>,
 }
 
 impl MLX90393Config {
-    pub fn new(slave_address: u8, sda: AnyIOPin, scl: AnyIOPin) -> Arc<Mutex<Self>> {
-        let me = Self { slave_address, sda, scl };
+    pub fn new(parameters: Arc<TrueNorthParameters>, slave_address: u8, sda: AnyIOPin, scl: AnyIOPin, int: AnyIOPin) -> Arc<Mutex<Self>> {
+        let me = Self { parameters, slave_address, sda, scl, int };
         Arc::new(Mutex::new(me))
     }
 }
@@ -32,15 +35,19 @@ impl MLX90393 {
     pub fn new(i2c: impl Peripheral<P = impl I2c> + 'static, config: Arc<Mutex<MLX90393Config>>) -> Result<Self, Box<dyn std::error::Error>> {
         let i2c = Self::init_i2c(i2c, config.clone())?;
         
+        let mut config = config.lock().unwrap();
+
         let me = Self { 
             inner: Arc::new(Mutex::new(MLX90393Inner { 
                 i2c: Some(i2c), 
-                slave_address: config.lock().unwrap().slave_address, 
+                int: unsafe { config.int.clone_unchecked() },
+                slave_address: config.slave_address, 
                 current_gain: None, 
                 current_resolution: None, 
                 current_filter: None, 
-                current_oversampling: None 
-            }))
+                current_oversampling: None,
+                parameters: config.parameters.clone()
+            })),
         };
         
         me.init()?;
@@ -51,28 +58,110 @@ impl MLX90393 {
     fn init(&self) -> Result<(), Box<dyn std::error::Error>> {
         let shared_self = self.inner.clone();
 
-        thread::sleep(std::time::Duration::from_millis(10));
-        if let Err(e) = self.exit_mode() {
-            log::warn!("Error exiting mode: {}", e);
-        }
-        thread::sleep(std::time::Duration::from_millis(10));
-        if let Err(e) = self.reset(){
-            log::warn!("Error resetting magnetometer: {}", e);
-        }
-        thread::sleep(std::time::Duration::from_millis(100));
-
-        self.set_gain(MLX90393GAIN::GAIN1X)?;
-        self.set_resolution(MLX90393AXIS::X, MLX90393RESOLUTION::RES17)?;
-        self.set_resolution(MLX90393AXIS::Y, MLX90393RESOLUTION::RES17)?;
-        self.set_resolution(MLX90393AXIS::Z, MLX90393RESOLUTION::RES16)?;
-        self.set_oversampling(MLX90393OVERSAMPLING::OSR3)?;
-        self.set_filter(MLX90393FILTER::FILTER5)?;
-        self.start_burst_measurement()?;
-
+        self.configure()?;
+    
         async fn monitor(_executor: &LocalExecutor<'_>, me: Arc<Mutex<MLX90393Inner>>) -> Result<(), Box<dyn std::error::Error>> {        
+
+            let int = unsafe { me.lock().unwrap().int.clone_unchecked() };
+
+            let mut interrupt_pin = {
+                if let Ok(iopin) = PinDriver::input(int) {
+                    iopin
+                } else {
+                    log::error!("Error setting up interruption");
+                    return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Error setting up interruption")));
+                }
+            };
+        
+            interrupt_pin.set_pull(Pull::Down).unwrap();
+            interrupt_pin.set_interrupt_type(InterruptType::PosEdge).unwrap();
+        
+            let notification = Notification::new();
+            let waker = notification.notifier();
+
+            unsafe {
+                interrupt_pin
+                    .subscribe_nonstatic(move || {
+                        waker.notify(NonZero::new(1).unwrap());
+                    })
+                    .unwrap();
+            }
+
+            me.lock().unwrap().start_burst_measurement()?;
+
             loop {
+
                 log::debug!("monitor thread...");
-                thread::sleep(std::time::Duration::from_secs(1));
+
+                if let Err(e) = interrupt_pin.enable_interrupt() {
+                    log::error!("Error enabling interrupt: {}", e);
+                }
+        
+                notification.wait_any();
+
+                {
+                    let mut lock_me = me.lock().unwrap();
+        
+                    match lock_me.read_measurement() {
+                        Ok(measurement) => {
+                            log::debug!("Measurement: {:?}", measurement);
+                            let x = measurement[0];
+                            let y = measurement[1];
+                            let z = measurement[2];
+    
+                            let parameters = lock_me.parameters.clone();
+    
+                            let mut max_x = parameters.max_x.lock().unwrap(); 
+                            let mut min_x = parameters.min_x.lock().unwrap();
+                            let mut max_y = parameters.max_y.lock().unwrap();
+                            let mut min_y = parameters.min_y.lock().unwrap();
+                            let mut max_z = parameters.max_z.lock().unwrap();
+                            let mut min_z = parameters.min_z.lock().unwrap();
+    
+                            if x > *max_x.get() {
+                                if let Err(e) = max_x.set(x) {
+                                    log::error!("Error setting max_x: {}", e);
+                                }
+                            }
+                            if x < *min_x.get() {
+                                if let Err(e) = min_x.set(x) {
+                                    log::error!("Error setting min_x: {}", e);
+                                }
+                            }
+                            if y > *max_y.get() {
+                                if let Err(e) = max_y.set(y) {
+                                    log::error!("Error setting max_y: {}", e);
+                                }
+                            }
+                            if y < *min_y.get() {
+                                if let Err(e) = min_y.set(y) {
+                                    log::error!("Error setting min_y: {}", e);
+                                }
+                            }
+                            if z > *max_z.get() {
+                                if let Err(e) = max_z.set(z) {
+                                    log::error!("Error setting max_z: {}", e);
+                                }
+                            }
+                            if z < *min_z.get() {
+                                if let Err(e) = min_z.set(z) {
+                                    log::error!("Error setting min_z: {}", e);
+                                }
+                            }
+    
+                            let mut heading =  (y.atan2(x) * 180.0) / std::f32::consts::PI;
+                            log::debug!("Heading 1: {}", heading);
+                            heading = heading.abs();
+                            log::debug!("Heading 2: {}", heading);
+                            if heading > 180.0 {
+                                heading = heading - 180.0;
+                            }
+                            log::debug!("Heading 3: {}", heading);
+                        }
+                        Err(e) => log::error!("Error reading measurement: {}", e),
+                    }        
+                        
+                }
             }
         }
 
@@ -93,6 +182,27 @@ impl MLX90393 {
         let config = esp_idf_hal::i2c::I2cConfig::new().baudrate(Hertz(100000));
         let i2c = I2cDriver::new(i2c, sda, scl, &config)?;
         Ok(i2c)
+    }
+
+    fn configure(&self) -> Result<(), Box<dyn std::error::Error>> {
+        thread::sleep(std::time::Duration::from_millis(10));
+        if let Err(e) = self.exit_mode() {
+            log::warn!("Error exiting mode: {}", e);
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+        if let Err(e) = self.reset(){
+            log::warn!("Error resetting magnetometer: {}", e);
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        self.set_gain(MLX90393GAIN::GAIN1X)?;
+        self.set_resolution(MLX90393AXIS::X, MLX90393RESOLUTION::RES17)?;
+        self.set_resolution(MLX90393AXIS::Y, MLX90393RESOLUTION::RES17)?;
+        self.set_resolution(MLX90393AXIS::Z, MLX90393RESOLUTION::RES16)?;
+        self.set_oversampling(MLX90393OVERSAMPLING::OSR3)?;
+        self.set_filter(MLX90393FILTER::FILTER5)?;
+
+        Ok(())
     }
 
     pub fn read_register(&self, register: MLX90393REG) -> Result<u16, Box<dyn std::error::Error>> {

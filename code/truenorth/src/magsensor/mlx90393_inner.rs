@@ -1,9 +1,12 @@
+use std::sync::Arc;
 use std::{thread, time::Duration};
 
 use esp_idf_hal::delay::BLOCK;
+use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::i2c::I2cDriver;
 
 use crate::magsensor::mlx90393_defs::*;
+use crate::TrueNorthParameters;
 
 // HALLCONF - 0x00
 // is the same table applying a scale factor of 98/75
@@ -53,11 +56,13 @@ const GAIN_RES_CONVERSION: [[(f32, f32); 8];4] = [
 
 pub struct MLX90393Inner {
     pub i2c: Option<I2cDriver<'static>>,
+    pub int: AnyIOPin,
     pub slave_address: u8,
     pub current_gain: Option<MLX90393GAIN>,
     pub current_resolution: Option<u16>,
     pub current_filter: Option<MLX90393FILTER>,
     pub current_oversampling: Option<MLX90393OVERSAMPLING>,
+    pub parameters: Arc<TrueNorthParameters>,
 }
 
 impl MLX90393Inner {
@@ -127,11 +132,6 @@ impl MLX90393Inner {
         let x_resolution = self.get_resolution(MLX90393AXIS::X)?;
         let y_resolution = self.get_resolution(MLX90393AXIS::Y)?;
         let z_resolution = self.get_resolution(MLX90393AXIS::Z)?;
-
-        log::debug!("Gain: {:?}", gain);
-        log::debug!("X resolution: {:?}", x_resolution);
-        log::debug!("Y resolution: {:?}", y_resolution);
-        log::debug!("Z resolution: {:?}", z_resolution);
 
         let ret = [
             val[0] as f32 * GAIN_RES_CONVERSION[x_resolution as usize][gain as usize].0,

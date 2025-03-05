@@ -57,7 +57,7 @@ impl<T: Clone +Send + 'static> SmartVar<T> {
             }
         }
 
-        if let Err(e) = thread::Builder::new().stack_size(20000).spawn(move || {
+        if let Err(e) = thread::Builder::new().stack_size(3000).spawn(move || {
             let executor = LocalExecutor::new();
     
             let fut = &mut pin!(updater(me.clone(), &executor, me.clone().lock().unwrap().rx.clone()));
@@ -163,6 +163,14 @@ impl<T: Clone +Send + 'static> SmartVar<T> {
                     return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SmartVar: self.value is not a String")));
                 }
             }
+        } else if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let mut buffer = vec![0u8; 4];
+            let value = nvs.lock().unwrap().get_raw(self.storage_name.as_ref().unwrap(), &mut buffer).unwrap();
+            if let Some(value) = value {  
+                if let Some(s) = (&mut self.value as &mut dyn Any).downcast_mut::<f32>() {
+                    *s = f32::from_le_bytes(value.try_into().unwrap());
+                }
+            }
         } else if std::any::TypeId::of::<T>() == std::any::TypeId::of::<String>() {
             if let Ok(size) = nvs.lock().unwrap().str_len(self.storage_name.as_ref().unwrap()) {
                 if let Some(size) = size {
@@ -233,6 +241,14 @@ impl<T: Clone +Send + 'static> SmartVar<T> {
         } else if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>() {
             if let Some(s) = (&mut self.value as &mut dyn Any).downcast_mut::<u8>() {
                 if let Err(err) = nvs.lock().unwrap().set_u8(self.storage_name.as_ref().unwrap(), *s) {
+                    return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("SmartVar: Error saving storage value: {}", err))));
+                }
+            }
+        } else if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            if let Some(s) = (&mut self.value as &mut dyn Any).downcast_mut::<f32>() {
+                let mut buffer = vec![0u8; 4];
+                buffer.copy_from_slice(&s.to_le_bytes());
+                if let Err(err) = nvs.lock().unwrap().set_raw(self.storage_name.as_ref().unwrap(), &buffer) {
                     return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("SmartVar: Error saving storage value: {}", err))));
                 }
             }

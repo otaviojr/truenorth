@@ -166,7 +166,7 @@ impl MLX90393 {
         }
 
         let shared_self_clone = Arc::clone(&shared_self);
-        thread::Builder::new().stack_size(20000).spawn(move || {
+        thread::Builder::new().stack_size(10000).spawn(move || {
             let executor = LocalExecutor::new();
             let fut = &mut pin!(monitor(&executor, shared_self_clone));
 

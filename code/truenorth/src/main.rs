@@ -88,9 +88,9 @@ fn main() {
 
     let parameters = Arc::new(TrueNorthParameters {
         declination: SmartVar::new(0),
-        max_x: SmartVar::new(0.0),
-        max_y: SmartVar::new(0.0),
-        max_z: SmartVar::new(0.0),
+        max_x: SmartVar::new(f32::MIN),
+        max_y: SmartVar::new(f32::MIN),
+        max_z: SmartVar::new(f32::MIN),
         min_x: SmartVar::new(f32::MAX),
         min_y: SmartVar::new(f32::MAX),
         min_z: SmartVar::new(f32::MAX),

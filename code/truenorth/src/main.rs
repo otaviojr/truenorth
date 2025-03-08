@@ -139,8 +139,8 @@ fn main() {
             }
             MagSensorEvent::HeadingChanged(heading) => {
                 log::debug!("Heading: {:?}", heading);
-            }
-            _ => {}
+            },
+            MagSensorEvent::RawChanged((_x, _y, _z)) => {}
         }
     })) {
         log::error!("Error adding handler: {}", err);

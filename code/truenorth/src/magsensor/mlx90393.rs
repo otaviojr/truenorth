@@ -399,6 +399,7 @@ impl MagSensor for MLX90393 {
             log::warn!("Error exiting mode: {}", e);
         }
         thread::sleep(Duration::from_millis(100));
+        inner_lock.set_wakeup_comparator(true)?;
         inner_lock.start_wakeup_measurement()?;
         inner_lock.set_state(MagSensorState::Measuring);
 

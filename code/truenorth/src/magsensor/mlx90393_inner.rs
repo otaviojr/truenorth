@@ -362,6 +362,17 @@ impl MLX90393Inner {
         Ok(())
     }
 
+    pub fn set_wakeup_comparator(&mut self, comparator: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let mut comparator_register = self.read_register(MLX90393REG::CONF2)?;
+        if comparator {
+            comparator_register |= 0x10;
+        } else {
+            comparator_register &= !0x10;
+        }
+        self.write_register(MLX90393REG::CONF2, comparator_register)?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn start_wakeup_measurement(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let tx_buf: [u8; 1] = [MLX90393CMD::SW as u8 | MLX90393AXIS::ALL as u8];

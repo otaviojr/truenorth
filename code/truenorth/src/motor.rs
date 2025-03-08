@@ -1,7 +1,6 @@
-use std::{pin::pin, sync::mpsc::{self, Receiver, Sender}, thread};
+use std::{sync::mpsc::{self, Receiver, Sender}, thread};
 use std::sync::{Arc, Mutex};
 
-use async_executor::LocalExecutor;
 use esp_idf_svc::hal::prelude::*;
 use esp_idf_hal::{gpio::AnyIOPin, ledc::{config::TimerConfig, LedcChannel, LedcDriver, LedcTimer, LedcTimerDriver, LowSpeed, Resolution}, peripheral::Peripheral};
 
@@ -53,45 +52,34 @@ where
         let rx = self.rx.clone();
         let end_rx = self.end_rx.clone();
 
-        thread::Builder::new().stack_size(1024 * 20).spawn(move || {
-            let executor = LocalExecutor::new();
-
-            async fn send(_executor: &LocalExecutor<'_>, rx: Arc<Mutex<Receiver<u32>>>, end_rx: Arc<Mutex<Receiver<bool>>>, driver: &mut LedcDriver<'_>) -> Result<(), Box<dyn std::error::Error>> {
-                loop {
-                    if let Ok(end) = end_rx.lock().unwrap().try_recv() {
-                        if end {
-                            break;
-                        }
+        thread::Builder::new().spawn(move || {
+            loop {
+                if let Ok(end) = end_rx.lock().unwrap().try_recv() {
+                    if end {
+                        break;
                     }
-
-                    if let Ok(angle) = rx.lock().unwrap().try_recv() {
-                        let time = ((angle * (2500 - 500)) / 180) + 500;
-    
-                        log::debug!("angle: {}", angle);
-                        log::debug!("time: {}us", time);
-    
-                        let max_duty = driver.get_max_duty();
-                        let duty_value = (time * (max_duty as u32)) / 20000;
-    
-                        log::debug!("max_duty: {}", max_duty);
-                        log::debug!("duty_value: {}", duty_value);
-    
-                        driver.set_duty(duty_value)?;
-                    }
-
-                    log::debug!("Motor: Sleeping");
-                    thread::sleep(std::time::Duration::from_millis(1000));
                 }
 
-                Ok(())
-            }
-    
-            let fut = &mut pin!(send(&executor, rx, end_rx, &mut driver));
-    
-            if let Err(e) = async_io::block_on(executor.run(fut)) {
-                log::error!("Error running motor pwm thread: {}", e);
-            }
+                if let Ok(angle) = rx.lock().unwrap().try_recv() {
+                    let time = ((angle * (2500 - 500)) / 180) + 500;
 
+                    log::debug!("angle: {}", angle);
+                    log::debug!("time: {}us", time);
+
+                    let max_duty = driver.get_max_duty();
+                    let duty_value = (time * (max_duty as u32)) / 20000;
+
+                    log::debug!("max_duty: {}", max_duty);
+                    log::debug!("duty_value: {}", duty_value);
+
+                    if let Err(e) = driver.set_duty(duty_value) {
+                        log::error!("Error setting duty: {}", e);
+                    }
+                }
+
+                //log::debug!("Motor: Sleeping");
+                thread::sleep(std::time::Duration::from_millis(1000));
+            }
             log::info!("Motor: thread ended");
         })?;
     

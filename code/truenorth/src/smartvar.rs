@@ -1,7 +1,8 @@
-use std::{any::{self, Any}, collections::HashMap, pin::pin, sync::{mpsc::{self, Receiver, Sender}, Arc, Mutex, MutexGuard}, thread};
+use std::{any::{self, Any}, collections::HashMap, sync::{mpsc::{self, Receiver, Sender}, Arc, Mutex, MutexGuard}, thread};
 
-use async_executor::LocalExecutor;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, EspNvsPartition, NvsDefault};
+
+use crate::Endable;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -23,14 +24,15 @@ pub struct SmartVar<T: Send> {
     storage_name: Option<String>,
     value: T,
     handlers: Vec<SmartVarHandlerPtr<T>>,
-    rx: Arc<Mutex<Receiver<SmartVarEvent<T>>>>,
-    tx: Sender<SmartVarEvent<T>>,
+    channel: (Sender<SmartVarEvent<T>>, Receiver<SmartVarEvent<T>>),
+    end_channel: (Sender<bool>, Receiver<bool>)
 }
 
 impl<T: Clone +Send + 'static> SmartVar<T> {
     pub fn new(value: T) -> Arc<Mutex<Self>> {
         let (tx, rx) = mpsc::channel::<SmartVarEvent<T>>();
-        let me = Arc::new(Mutex::new(Self { namespace: Option::None, storage_name: Option::None, value, handlers: Vec::new(), rx: Arc::new(Mutex::new(rx)), tx }));
+        let (tx_end, rx_end) = mpsc::channel::<bool>(); 
+        let me = Arc::new(Mutex::new(Self { namespace: Option::None, storage_name: Option::None, value, handlers: Vec::new(), channel: (tx, rx), end_channel: (tx_end, rx_end) }));
         
         // Lock the mutex and call setup
         {
@@ -42,29 +44,38 @@ impl<T: Clone +Send + 'static> SmartVar<T> {
     }
 
     fn setup(&mut self, me: Arc<Mutex<Self>>) {
-        async fn updater<T: Clone +Send + 'static>(me: Arc<Mutex<SmartVar<T>>>, _executor: &LocalExecutor<'_>, rx: Arc<Mutex<Receiver<SmartVarEvent<T>>>>) -> Result<(), Box<dyn std::error::Error>> {
-            loop {
-                if let Ok(event) = rx.lock().unwrap().recv() {
-                    match event {
-                        SmartVarEvent::Changed(value) => {
-                            //log::debug!("SmartVar:Changed: {}", value);
-                            for handler in me.lock().unwrap().handlers.iter_mut() {
-                                handler.handler.lock().unwrap()(&value, handler.parameters.lock().unwrap());
-                            }                    
+        let me_shared = me.clone();
+        if let Err(e) = thread::Builder::new().spawn(move || {
+            'main_loop: loop {
+
+                {
+                    let mut lock_me = me_shared.lock().unwrap();
+
+                    if let Ok(end) = lock_me.end_channel.1.try_recv() {
+                        if end {
+                            break 'main_loop;
+                        }
+                    }
+
+                    if let Ok(event) = lock_me.channel.1.try_recv() {
+                        match event {
+                            SmartVarEvent::Changed(value) => {
+                                //log::debug!("SmartVar:Changed");
+                                for handler in lock_me.handlers.iter_mut() {
+                                    handler.handler.lock().unwrap()(&value, handler.parameters.lock().unwrap());
+                                }                    
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        if let Err(e) = thread::Builder::new().stack_size(3000).spawn(move || {
-            let executor = LocalExecutor::new();
-    
-            let fut = &mut pin!(updater(me.clone(), &executor, me.clone().lock().unwrap().rx.clone()));
-    
-            async_io::block_on(executor.run(fut)).unwrap();
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            log::info!("SmartVar:updater thread ended");
+
         }) {
-            log::error!("SmartVar:updater: {}", e);
+            log::error!("SmartVar:updater error: {}", e);
         }
     }
 
@@ -200,7 +211,7 @@ impl<T: Clone +Send + 'static> SmartVar<T> {
             return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SmartVar: Type not supported")));
         }
 
-        self.tx.send(SmartVarEvent::Changed(self.value.clone())).unwrap();
+        self.channel.0.send(SmartVarEvent::Changed(self.value.clone())).unwrap();
 
         Ok(())
     }
@@ -278,11 +289,17 @@ impl<T: Clone +Send + 'static> SmartVar<T> {
                 log::warn!("Error: {}", e);
             }
         }
-        self.tx.send(SmartVarEvent::Changed(value.clone()))?;
+        self.channel.0.send(SmartVarEvent::Changed(value.clone()))?;
         Ok(())
     }
 
     pub fn get(&self) -> &T {
         &self.value
+    }
+}
+
+impl<T: Clone +Send + 'static> Endable for SmartVar<T> {
+    fn end(&self) {
+        self.end_channel.0.send(true).unwrap();
     }
 }

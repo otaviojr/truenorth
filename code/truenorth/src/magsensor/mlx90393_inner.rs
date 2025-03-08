@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{mpsc, Arc, Mutex};
 use std::{thread, time::Duration};
 
 use esp_idf_hal::delay::BLOCK;
@@ -7,6 +8,8 @@ use esp_idf_hal::i2c::I2cDriver;
 
 use crate::magsensor::mlx90393_defs::*;
 use crate::TrueNorthParameters;
+
+use super::{MagSensorEvent, MagSensorHandlerPtr, MagSensorState};
 
 // HALLCONF - 0x00
 // is the same table applying a scale factor of 98/75
@@ -54,18 +57,56 @@ const GAIN_RES_CONVERSION: [[(f32, f32); 8];4] = [
     ],
 ];
 
-pub struct MLX90393Inner {
-    pub i2c: Option<I2cDriver<'static>>,
-    pub int: AnyIOPin,
-    pub slave_address: u8,
+pub struct MLX90393Internal {
     pub current_gain: Option<MLX90393GAIN>,
     pub current_resolution: Option<u16>,
     pub current_filter: Option<MLX90393FILTER>,
     pub current_oversampling: Option<MLX90393OVERSAMPLING>,
+    pub state: MagSensorState,
+    pub last_state: MagSensorState,
+    pub channel: Arc<Mutex<(Sender<bool>,Receiver<bool>)>>,
+    pub handlers: Vec<Arc<Mutex<MagSensorHandlerPtr>>>,
+}
+
+impl Default for MLX90393Internal {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel::<bool>();
+        Self {
+            current_gain: None,
+            current_resolution: None,
+            current_filter: None,
+            current_oversampling: None,
+            state: MagSensorState::Idle,
+            last_state: MagSensorState::Idle,
+            channel: Arc::new(Mutex::new((tx, rx))),
+            handlers: Vec::new(),
+        }
+    }
+}
+
+pub struct MLX90393Inner {
+    pub i2c: Option<I2cDriver<'static>>,
+    pub int: AnyIOPin,
+    pub slave_address: u8,
     pub parameters: Arc<TrueNorthParameters>,
+    pub internal: MLX90393Internal,
 }
 
 impl MLX90393Inner {
+
+    pub fn send_event(&mut self, event: MagSensorEvent) -> Result<(), Box<dyn std::error::Error>> {
+        let handlers = self.internal.handlers.iter();
+        for handler in handlers {
+            handler.lock().unwrap()(event);
+        }
+        Ok(())
+    }
+
+    pub fn set_state(&mut self, state: MagSensorState) {
+        self.internal.last_state = self.internal.state;
+        self.internal.state = state;
+    }
+
     #[allow(dead_code)]
     pub fn read_register(&mut self, register: MLX90393REG) -> Result<u16, Box<dyn std::error::Error>> {
         let tx_buf: [u8; 2] = [MLX90393CMD::RR.into(), (register as u8) << 2];
@@ -154,7 +195,7 @@ impl MLX90393Inner {
 
         self.write_register(MLX90393REG::CONF1, gain)?;
 
-        self.current_gain = Some(new_gain);
+        self.internal.current_gain = Some(new_gain);
 
         Ok(())
     }
@@ -162,8 +203,8 @@ impl MLX90393Inner {
     #[allow(dead_code)]
     pub fn get_gain(&mut self) -> Result<MLX90393GAIN, Box<dyn std::error::Error>> {
 
-        if self.current_gain.is_some() {
-            return Ok(self.current_gain.unwrap());
+        if self.internal.current_gain.is_some() {
+            return Ok(self.internal.current_gain.unwrap());
         }
 
         let mut gain = self.read_register(MLX90393REG::CONF1)?;
@@ -194,15 +235,15 @@ impl MLX90393Inner {
 
         self.write_register(MLX90393REG::CONF3, resolution)?;
 
-        self.current_resolution = Some(resolution);
+        self.internal.current_resolution = Some(resolution);
 
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_resolution(&mut self, axis: MLX90393AXIS) -> Result<MLX90393RESOLUTION, Box<dyn std::error::Error>> {
-        let resolution = if self.current_resolution.is_some() {
-            self.current_resolution.unwrap()
+        let resolution = if self.internal.current_resolution.is_some() {
+            self.internal.current_resolution.unwrap()
         } else {
             self.read_register(MLX90393REG::CONF3)?
         };
@@ -222,14 +263,14 @@ impl MLX90393Inner {
         filter |= (new_filter as u16) << 2;
         self.write_register(MLX90393REG::CONF3, filter)?;
 
-        self.current_filter = Some(new_filter);
+        self.internal.current_filter = Some(new_filter);
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_filter(&mut self) -> Result<MLX90393FILTER, Box<dyn std::error::Error>> {
-        if self.current_filter.is_some() {
-            return Ok(self.current_filter.unwrap());
+        if self.internal.current_filter.is_some() {
+            return Ok(self.internal.current_filter.unwrap());
         }
 
         let filter = self.read_register(MLX90393REG::CONF3)?;
@@ -243,14 +284,14 @@ impl MLX90393Inner {
         oversampling |= new_oversampling as u16;
         self.write_register(MLX90393REG::CONF3, oversampling)?;
 
-        self.current_oversampling = Some(new_oversampling);
+        self.internal.current_oversampling = Some(new_oversampling);
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_oversampling(&mut self) -> Result<MLX90393OVERSAMPLING, Box<dyn std::error::Error>> {
-        if self.current_oversampling.is_some() {
-            return Ok(self.current_oversampling.unwrap());
+        if self.internal.current_oversampling.is_some() {
+            return Ok(self.internal.current_oversampling.unwrap());
         }
 
         let oversampling = self.read_register(MLX90393REG::CONF3)?;
@@ -386,5 +427,10 @@ impl MLX90393Inner {
         }
 
         Ok(())
-    }        
+    }
+
+    pub fn add_handler(&mut self, handler: MagSensorHandlerPtr) -> Result<(), Box<dyn std::error::Error>> {
+        self.internal.handlers.push(Arc::new(Mutex::new(handler)));
+        Ok(())
+    }
 }

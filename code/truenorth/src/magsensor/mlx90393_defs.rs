@@ -1,4 +1,5 @@
-#[derive(Debug)]
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MLX90393REG {
     CONF1 = 0x00,
     CONF2 = 0x01,

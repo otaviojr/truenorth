@@ -8,14 +8,12 @@ use crate::smartvar::SmartVar;
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
 use std::thread;
 //use rand::Rng;
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::cell::RefCell;
 use std::sync::Arc;
-use std::pin::pin;
-use async_io;
-use async_executor::LocalExecutor;
 
 use esp32_nimble::utilities::BleUuid;
 use esp32_nimble::NimbleProperties;
@@ -24,6 +22,8 @@ use esp_idf_svc::hal::prelude::*;
 
 use magsensor::mlx90393::MLX90393Config;
 use magsensor::mlx90393::MLX90393;
+use magsensor::{MagSensor, MagSensorEvent};
+
 thread_local! {
     #[allow(clippy::thread_local_initializer_can_be_made_const)]
     static TAG_NAMESPACE:RefCell<&'static str> =  RefCell::new("truenorth");
@@ -43,7 +43,7 @@ pub struct TrueNorthParameters {
     pub max_z: Arc<Mutex<SmartVar<f32>>>,
     pub min_x: Arc<Mutex<SmartVar<f32>>>,
     pub min_y: Arc<Mutex<SmartVar<f32>>>,
-    pub min_z: Arc<Mutex<SmartVar<f32>>>,
+    pub min_z: Arc<Mutex<SmartVar<f32>>>
 }
 
 pub trait Endable {
@@ -88,13 +88,21 @@ fn main() {
 
     let parameters = Arc::new(TrueNorthParameters {
         declination: SmartVar::new(0),
-        max_x: SmartVar::new(f32::MIN),
-        max_y: SmartVar::new(f32::MIN),
-        max_z: SmartVar::new(f32::MIN),
-        min_x: SmartVar::new(f32::MAX),
-        min_y: SmartVar::new(f32::MAX),
-        min_z: SmartVar::new(f32::MAX),
+        max_x: SmartVar::new(f32::MIN), //0xFFFF7FFF
+        max_y: SmartVar::new(f32::MIN), //0xFFFF7FFF
+        max_z: SmartVar::new(f32::MIN), //0xFFFF7FFF
+        min_x: SmartVar::new(f32::MAX), //0xFFFF7F7F
+        min_y: SmartVar::new(f32::MAX), //0xFFFF7F7F
+        min_z: SmartVar::new(f32::MAX)
     });
+
+    endable.add(parameters.clone().declination.clone());
+    endable.add(parameters.clone().max_x.clone());
+    endable.add(parameters.clone().max_y.clone());
+    endable.add(parameters.clone().max_z.clone());
+    endable.add(parameters.clone().min_x.clone());
+    endable.add(parameters.clone().min_y.clone());
+    endable.add(parameters.clone().min_z.clone());
 
     #[allow(unused)]
 
@@ -114,14 +122,39 @@ fn main() {
 
     let config = MLX90393Config::new(parameters.clone(), 0x0C, pins.gpio8.into(), pins.gpio9.into(), pins.gpio1.into());
     
-    let _mag = match MLX90393::new(peripherals.i2c0, config) {
+    let mag = match MLX90393::new(peripherals.i2c0, config) {
         Ok(mag) => Arc::new(Mutex::new(mag)),
         Err(_error) => {
             halt_system(&mut endable);
             return;
         }
     };
+
+    endable.add(mag.clone());
+
+    if let Err(err) = mag.lock().unwrap().add_handler(Box::new(|event| {
+        match event {
+            MagSensorEvent::CalibratedChanged((max_x, min_x), (max_y, min_y), (max_z, min_z)) => {
+                log::debug!("Calibrated: {:?}, {:?}, {:?}", (max_x, min_x), (max_y, min_y), (max_z, min_z));
+            }
+            MagSensorEvent::HeadingChanged(heading) => {
+                log::debug!("Heading: {:?}", heading);
+            }
+            _ => {}
+        }
+    })) {
+        log::error!("Error adding handler: {}", err);
+    }
     
+    let bt_receiver = match setup_bt_server(parameters.clone()) {
+        Ok(receiver) => receiver,
+        Err(err) => {
+            log::error!("Error setting up advertisement: {}", err);
+            halt_system(&mut endable);
+            return;
+        }
+    };
+
     if let Err(err) = setup_bt_server(parameters.clone()) {
         log::error!("Error setting up advertisement: {}", err);
     }
@@ -159,7 +192,51 @@ fn main() {
         log::error!("Error setting up min_z storage: {}", err);
     }
 
+    if let Err(err) = mag.lock().unwrap().start() {
+        log::error!("Error starting mag: {}", err);
+        halt_system(&mut endable);
+        return;
+    }
+
+    //halt_system(&mut endable);
+
     loop {
+
+        if let Ok(command) = bt_receiver.try_recv() {
+            match command {
+                BluetoothCommand::ResetCalibrationData => {
+                    if let Err(err) = parameters.clone().max_x.lock().unwrap().set(f32::MIN) {
+                        log::error!("Error setting max_x: {}", err);
+                    }
+                    if let Err(err) = parameters.clone().max_y.lock().unwrap().set(f32::MIN) {
+                        log::error!("Error setting max_y: {}", err);
+                    }
+                    if let Err(err) = parameters.clone().max_z.lock().unwrap().set(f32::MIN) {
+                        log::error!("Error setting max_z: {}", err);
+                    }
+                    if let Err(err) = parameters.clone().min_x.lock().unwrap().set(f32::MAX) {
+                        log::error!("Error setting min_x: {}", err);
+                    }
+                    if let Err(err) = parameters.clone().min_y.lock().unwrap().set(f32::MAX) {
+                        log::error!("Error setting min_y: {}", err);
+                    }
+                    if let Err(err) = parameters.clone().min_z.lock().unwrap().set(f32::MAX) {
+                        log::error!("Error setting min_z: {}", err);
+                    }
+                }
+                BluetoothCommand::Calibrate => {
+                    if let Err(err) = mag.lock().unwrap().calibrate(std::time::Duration::from_secs(60)) {
+                        log::error!("Error calibrating mag: {}", err);
+                    }
+                    if let Err(err) = mag.lock().unwrap().start() {
+                        log::error!("Error starting mag: {}", err);
+                    }
+                }
+                _ => {
+                    log::error!("Unknown bluetooth command");
+                }
+            }
+        }
         //if let Err(e) = mag.lock().unwrap().start_single_measurement() {
         //    log::error!("Error starting single measurement: {}", e);
         //}
@@ -183,24 +260,53 @@ fn main() {
         if let Err(e) = motor.lock().unwrap().set_angle(angle) {
             log::error!("Error sending message: {}", e);
         }*/
-        thread::sleep(std::time::Duration::from_secs(60));
+        thread::sleep(std::time::Duration::from_millis(1000));
     }
 }
 
 #[allow(unused)]
 fn halt_system(endable: &mut EndableHandler) {
-    log::error!("Halting system");
     endable.end_all();
+    log::error!("Halting system");
     loop {
         thread::sleep(std::time::Duration::from_secs(1));
     }
 }
 
-fn setup_bt_server(parameters: Arc<TrueNorthParameters>) -> Result<(), Box<dyn std::error::Error>> {
+enum BluetoothCommand {
+    Unknown = 0x00,
+    ResetCalibrationData = 0x01,
+    Calibrate = 0x02,
+}
 
+impl From<u8> for BluetoothCommand {
+    fn from(value: u8) -> Self {
+        match value {
+            0x01 => BluetoothCommand::ResetCalibrationData,
+            0x02 => BluetoothCommand::Calibrate,
+            _ => BluetoothCommand::Unknown,
+        }
+    }
+}
+
+impl From<BluetoothCommand> for u8 {
+    fn from(value: BluetoothCommand) -> Self {
+        match value {
+            BluetoothCommand::ResetCalibrationData => 0x01,
+            BluetoothCommand::Calibrate => 0x02,
+            _ => 0x00,
+        }
+    }
+}
+
+fn setup_bt_server(parameters: Arc<TrueNorthParameters>) -> Result<Receiver<BluetoothCommand>, Box<dyn std::error::Error>> {
+
+    let (sender, receiver) = mpsc::channel::<BluetoothCommand>();
+    
     let ble_device = Arc::new(Mutex::new(BLEDevice::take()));
 
-    async fn ble_server(_executor: &LocalExecutor<'_>, ble_device: Arc<Mutex<&'static mut BLEDevice>>, parameters: Arc<TrueNorthParameters>) -> Result<(), Box<dyn std::error::Error>> {        
+    thread::Builder::new().spawn(move || {
+
         let ble_advertiser = ble_device.lock().unwrap().get_advertising();
 
         ble_device
@@ -250,121 +356,31 @@ fn setup_bt_server(parameters: Arc<TrueNorthParameters>) -> Result<(), Box<dyn s
             });                
         }
 
-        let max_x_characteristic = truenorth_service.lock().create_characteristic(
+        let command_characteristic = truenorth_service.lock().create_characteristic(
             BleUuid::from_uuid16(0x1001),
-            NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY);
+            NimbleProperties::WRITE | NimbleProperties::NOTIFY);
 
-        {
-            let max_x_parameter = parameters.max_x.clone();
-
-            max_x_characteristic.lock().on_write(move|value| {
-                let data = value.recv_data();
-                log::debug!("Correction received: {:?}", data);
-                if let Err(err) = max_x_parameter.lock().unwrap().set(f32::from_le_bytes(data.try_into().unwrap())) {
-                    log::error!("Error setting max_x: {}", err);
+        command_characteristic.lock().on_write(move|_value| {
+            let data = _value.recv_data();
+            log::debug!("Command received: {:?}", data);
+            match BluetoothCommand::from(data[0]) {
+                BluetoothCommand::ResetCalibrationData => {
+                    sender.send(BluetoothCommand::ResetCalibrationData).unwrap();
                 }
-                log::debug!("Correction set to: {}", max_x_parameter.lock().unwrap().get());
-                value.notify();
-            });                
-        }
-
-        let max_y_characteristic = truenorth_service.lock().create_characteristic(
-            BleUuid::from_uuid16(0x1002),
-            NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY);
-
-        {
-            let max_y_parameter = parameters.max_y.clone();
-
-            max_y_characteristic.lock().on_write(move|value| {
-                let data = value.recv_data();
-                log::debug!("Correction received: {:?}", data);
-                if let Err(err) = max_y_parameter.lock().unwrap().set(f32::from_le_bytes(data.try_into().unwrap())) {
-                    log::error!("Error setting max_y: {}", err);
+                BluetoothCommand::Calibrate => {
+                    sender.send(BluetoothCommand::Calibrate).unwrap();
                 }
-                log::debug!("Correction set to: {}", max_y_parameter.lock().unwrap().get());
-                value.notify();
-            });                
-        }
+                _ => log::debug!("Unknown command"),
+            }
+        });
 
-        let max_z_characteristic = truenorth_service.lock().create_characteristic(
-            BleUuid::from_uuid16(0x1003),
-            NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY);
-
-        {
-            let max_z_parameter = parameters.max_z.clone();
-
-            max_z_characteristic.lock().on_write(move|value| {
-                let data = value.recv_data();
-                log::debug!("Correction received: {:?}", data);
-                if let Err(err) = max_z_parameter.lock().unwrap().set(f32::from_le_bytes(data.try_into().unwrap())) {
-                    log::error!("Error setting max_z: {}", err);
-                }
-                log::debug!("Correction set to: {}", max_z_parameter.lock().unwrap().get());
-                value.notify();
-            });                
-        }
-
-        let min_x_characteristic = truenorth_service.lock().create_characteristic(
-            BleUuid::from_uuid16(0x1004),
-            NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY);
-
-
-        {
-            let min_x_parameter = parameters.min_x.clone();
-    
-            min_x_characteristic.lock().on_write(move|value| {
-                let data = value.recv_data();
-                log::debug!("Correction received: {:?}", data);
-                if let Err(err) = min_x_parameter.lock().unwrap().set(f32::from_le_bytes(data.try_into().unwrap())) {
-                    log::error!("Error setting min_x: {}", err);
-                }
-                log::debug!("Correction set to: {}", min_x_parameter.lock().unwrap().get());
-                value.notify();
-            });
-        }
-
-        let min_y_characteristic = truenorth_service.lock().create_characteristic(
-            BleUuid::from_uuid16(0x1005),
-            NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY);
-
-
-        {
-            let min_y_parameter = parameters.min_y.clone();
-    
-            min_y_characteristic.lock().on_write(move|value| {
-                let data = value.recv_data();
-                log::debug!("Correction received: {:?}", data);
-                if let Err(err) = min_y_parameter.lock().unwrap().set(f32::from_le_bytes(data.try_into().unwrap())) {
-                    log::error!("Error setting min_y: {}", err);
-                }
-                log::debug!("Correction set to: {}", min_y_parameter.lock().unwrap().get());
-                value.notify();
-            });
-        }
-
-        let min_z_characteristic = truenorth_service.lock().create_characteristic(
-            BleUuid::from_uuid16(0x1006),
-            NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY);
-
-
-        {
-            let min_z_parameter = parameters.min_z.clone();
-    
-            min_z_characteristic.lock().on_write(move|value| {
-                let data = value.recv_data();
-                log::debug!("Correction received: {:?}", data);
-                if let Err(err) = min_z_parameter.lock().unwrap().set(f32::from_le_bytes(data.try_into().unwrap())) {
-                    log::error!("Error setting min_z: {}", err);
-                }
-                log::debug!("Correction set to: {}", min_z_parameter.lock().unwrap().get());
-                value.notify();
-            });
-        }
-
-        ble_advertiser.lock().set_data(BLEAdvertisementData::new()
+        if let Err(err) = ble_advertiser.lock().set_data(BLEAdvertisementData::new()
             .name("TrueNorth")
             .add_service_uuid(BleUuid::from_uuid16(0x6969))
-        )?;
+        ) {
+            log::error!("Error setting advertisement data: {}", err);
+            return;
+        }
 
         ble_advertiser
             .lock()
@@ -373,7 +389,10 @@ fn setup_bt_server(parameters: Arc<TrueNorthParameters>) -> Result<(), Box<dyn s
             .scan_response(false);
     
         // Start Advertising
-        ble_advertiser.lock().start()?;
+        if let Err(err) = ble_advertiser.lock().start() {
+            log::error!("Error starting advertisement: {}", err);
+            return;
+        }
     
         log::info!("Advertisement Started");
 
@@ -392,101 +411,10 @@ fn setup_bt_server(parameters: Arc<TrueNorthParameters>) -> Result<(), Box<dyn s
             
         }
 
-        {
-            let max_x_parameter = parameters.max_x.clone();
-
-            max_x_parameter.lock().unwrap().add_handler(Box::new(|value, parameters| {
-                let dc = parameters.get("characteristic").unwrap().downcast_ref::<Arc<esp32_nimble::utilities::mutex::Mutex<BLECharacteristic>>>();
-                if let Some(dc) = dc {
-                    dc.lock().set_value(value.to_le_bytes().to_vec().as_slice()).notify();
-                    log::debug!("BleCallback: max_x SmartVar changed to: {}", value);
-                } else {
-                    log::error!("BleCallback:Characteristic not found");
-                }
-            }), HashMap::from([("characteristic".to_string(), Box::new(max_x_characteristic.clone()) as Box<dyn Any + Send>)]));
-            
-        }
-
-        {
-            let max_y_parameter = parameters.max_y.clone();
-
-            max_y_parameter.lock().unwrap().add_handler(Box::new(|value, parameters| {
-                let dc = parameters.get("characteristic").unwrap().downcast_ref::<Arc<esp32_nimble::utilities::mutex::Mutex<BLECharacteristic>>>();
-                if let Some(dc) = dc {
-                    dc.lock().set_value(value.to_le_bytes().to_vec().as_slice()).notify();
-                    log::debug!("BleCallback: max_y SmartVar changed to: {}", value);
-                } else {
-                    log::error!("BleCallback:Characteristic not found");
-                }
-            }), HashMap::from([("characteristic".to_string(), Box::new(max_y_characteristic.clone()) as Box<dyn Any + Send>)]));    
-        }
-
-        {
-            let max_z_parameter = parameters.max_z.clone(); 
-
-            max_z_parameter.lock().unwrap().add_handler(Box::new(|value, parameters| {  
-                let dc = parameters.get("characteristic").unwrap().downcast_ref::<Arc<esp32_nimble::utilities::mutex::Mutex<BLECharacteristic>>>();
-                if let Some(dc) = dc {
-                    dc.lock().set_value(value.to_le_bytes().to_vec().as_slice()).notify();
-                    log::debug!("BleCallback: max_z SmartVar changed to: {}", value);
-                }
-            }), HashMap::from([("characteristic".to_string(), Box::new(max_z_characteristic.clone()) as Box<dyn Any + Send>)]));
-        }
-
-        {
-            let min_x_parameter = parameters.min_x.clone();
-
-            min_x_parameter.lock().unwrap().add_handler(Box::new(|value, parameters| {
-                let dc = parameters.get("characteristic").unwrap().downcast_ref::<Arc<esp32_nimble::utilities::mutex::Mutex<BLECharacteristic>>>();
-                if let Some(dc) = dc {
-                    dc.lock().set_value(value.to_le_bytes().to_vec().as_slice()).notify();
-                    log::debug!("BleCallback: min_x SmartVar changed to: {}", value);
-                } else {
-                    log::error!("BleCallback:Characteristic not found");
-                }
-            }), HashMap::from([("characteristic".to_string(), Box::new(min_x_characteristic.clone()) as Box<dyn Any + Send>)]));
-            
-        }
-
-        {
-            let min_y_parameter = parameters.min_y.clone();
-
-            min_y_parameter.lock().unwrap().add_handler(Box::new(|value, parameters| {
-                let dc = parameters.get("characteristic").unwrap().downcast_ref::<Arc<esp32_nimble::utilities::mutex::Mutex<BLECharacteristic>>>();
-                if let Some(dc) = dc {
-                    dc.lock().set_value(value.to_le_bytes().to_vec().as_slice()).notify();
-                    log::debug!("BleCallback: min_y SmartVar changed to: {}", value);
-                } else {
-                    log::error!("BleCallback:Characteristic not found");
-                }
-            }), HashMap::from([("characteristic".to_string(), Box::new(min_y_characteristic.clone()) as Box<dyn Any + Send>)]));    
-        }
-
-        {
-            let min_z_parameter = parameters.min_z.clone(); 
-
-            min_z_parameter.lock().unwrap().add_handler(Box::new(|value, parameters| {  
-                let dc = parameters.get("characteristic").unwrap().downcast_ref::<Arc<esp32_nimble::utilities::mutex::Mutex<BLECharacteristic>>>();
-                if let Some(dc) = dc {
-                    dc.lock().set_value(value.to_le_bytes().to_vec().as_slice()).notify();
-                    log::debug!("BleCallback: min_z SmartVar changed to: {}", value);
-                }
-            }), HashMap::from([("characteristic".to_string(), Box::new(min_z_characteristic.clone()) as Box<dyn Any + Send>)]));
-        }
-
         loop {
-            log::debug!("ble server thread...");
-            thread::sleep(std::time::Duration::from_secs(10));
+            thread::sleep(std::time::Duration::from_secs(1));
         }
-    }
-
-    thread::Builder::new().stack_size(20000).spawn(move || {
-        let executor = LocalExecutor::new();
-
-        let fut = &mut pin!(ble_server(&executor, ble_device, parameters));
-
-        async_io::block_on(executor.run(fut)).unwrap();
     })?;
 
-    Ok(())
+    Ok(receiver)
 }

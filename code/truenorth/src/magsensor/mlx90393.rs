@@ -1,6 +1,6 @@
 
 use core::f32;
-use std::{num::NonZero, sync::{Arc, Mutex}, thread, time::Duration};
+use std::{num::NonZero, sync::{Arc, Mutex}, thread, time::{Duration, Instant}};
 
 use esp_idf_svc::hal::{gpio::{AnyIOPin, PinDriver, Pull, InterruptType}, i2c::{I2c, I2cDriver}, peripheral::Peripheral, units::Hertz};
 use esp_idf_svc::hal::task::notification::Notification;
@@ -12,8 +12,11 @@ use crate::magsensor::mlx90393_inner::{MLX90393Inner, MLX90393Internal};
 
 use super::MagSensorHandlerPtr;
 
-const CALIBRATION_SAMPLES: usize = 50;
-const MEASUREMENT_SAMPLES: usize = 1000;
+const CALIBRATION_SAMPLES: usize = 30;
+const MEASUREMENT_SAMPLES: usize = 100;
+
+const CALIBRATION_SAMPLE_TIME: u128 = 10;
+const MEASUREMENT_SAMPLE_TIME: u128 = 1000;
 
 pub struct MLX90393Config {
     slave_address: u8,
@@ -95,8 +98,13 @@ impl MLX90393 {
             let mut pool_y = vec![];
             let mut pool_z = vec![];
 
+            let mut avg_x = 0.0;
+            let mut avg_y = 0.0;
+            let mut avg_z = 0.0;
+
             let mut measure_event = MagSensorEvent::HeadingChanged(0);
 
+            let mut current_time = Instant::now();
 
             'thread_loop: loop {
 
@@ -127,31 +135,35 @@ impl MLX90393 {
                             let y = measurement[1];
                             let z = measurement[2];
 
-                            pool_x.push(x);
-                            pool_y.push(y);
-                            pool_z.push(z);
+                            if current_time.elapsed().as_millis() > if lock_me.internal.state == MagSensorState::Calibrating { CALIBRATION_SAMPLE_TIME } else { MEASUREMENT_SAMPLE_TIME } {
+                                pool_x.push(x);
+                                pool_y.push(y);
+                                pool_z.push(z);
+                                current_time = Instant::now();
 
-                            if pool_x.len() > MEASUREMENT_SAMPLES {
-                                pool_x.remove(0);
-                                pool_y.remove(0);
-                                pool_z.remove(0);
-                            }
-
-                            let (avg_x, avg_y, avg_z) = {
-                                let mut sum_x = 0.0;
-                                let mut sum_y = 0.0;
-                                let mut sum_z = 0.0;
-
-                                let len = if lock_me.internal.state == MagSensorState::Calibrating { if pool_x.len() < CALIBRATION_SAMPLES { pool_x.len() } else { CALIBRATION_SAMPLES } } else { pool_x.len() };
-
-                                for i in pool_x.len()-len..pool_x.len() {
-                                    sum_x += pool_x[i];
-                                    sum_y += pool_y[i];
-                                    sum_z += pool_z[i];
+                                if pool_x.len() > MEASUREMENT_SAMPLES {
+                                    pool_x.remove(0);
+                                    pool_y.remove(0);
+                                    pool_z.remove(0);
                                 }
 
-                                (sum_x / len as f32, sum_y / len as f32, sum_z / len as f32)
-                            };
+                                (avg_x, avg_y, avg_z) = {
+                                    let mut sum_x = 0.0;
+                                    let mut sum_y = 0.0;
+                                    let mut sum_z = 0.0;
+    
+                                    let len = if lock_me.internal.state == MagSensorState::Calibrating { if pool_x.len() < CALIBRATION_SAMPLES { pool_x.len() } else { CALIBRATION_SAMPLES } } else { pool_x.len() };
+    
+                                    for i in pool_x.len()-len..pool_x.len() {
+                                        sum_x += pool_x[i];
+                                        sum_y += pool_y[i];
+                                        sum_z += pool_z[i];
+                                    }
+    
+                                    (sum_x / len as f32, sum_y / len as f32, sum_z / len as f32)
+                                };
+                            }
+
 
                             let event = MagSensorEvent::RawChanged((avg_x, avg_y, avg_z));
                             if let Err(e) = lock_me.send_event(event) {
@@ -215,34 +227,28 @@ impl MLX90393 {
                             }
 
                             if lock_me.internal.state == MagSensorState::Measuring {
-
-                                //log::debug!("max_x: {}", max_x.get());
-                                //log::debug!("min_x: {}", min_x.get());
-                                //log::debug!("max_y: {}", max_y.get());
-                                //log::debug!("min_y: {}", min_y.get());
-
-                                let calc_x = avg_x-((*max_x.get() + *min_x.get())/2.0);
-                                let calc_y = avg_y-((*max_y.get() + *min_y.get())/2.0);
+                                let calc_x = (x+avg_x)/2.0 - ((*max_x.get() + *min_x.get())/2.0);
+                                let calc_y = (y+avg_y)/2.0 - ((*max_y.get() + *min_y.get())/2.0);
 
                                 let mut heading =  (calc_x.atan2(calc_y) * 180.0) / std::f32::consts::PI;
-                                //log::debug!("Heading 1: {}", heading);
+
                                 if heading < 0.0 {
                                     heading = heading + 360.0;
                                 }
-                                //log::debug!("Heading 2: {}", heading);
-                                //if heading > 180.0 {
-                                //    heading = heading - 180.0;
-                                //}
 
                                 let value = match measure_event.clone() {
                                     MagSensorEvent::HeadingChanged(value) => value,
                                     _ => 0,
                                 };
 
-                                let heading_notify_min = heading.round() as i32 - 1;
-                                let heading_notify_max = heading.round() as i32 + 1;
+                                // Calculate the difference between the current heading and the previous heading in degrees
+                                let diff = if (value - heading.round() as i32).abs() > 180 {
+                                    360 - (value - heading.round() as i32).abs()
+                                } else {
+                                    (value - heading.round() as i32).abs()
+                                };
 
-                                if value < heading_notify_min || value > heading_notify_max {
+                                if diff > 2 {
                                     measure_event = MagSensorEvent::HeadingChanged(heading.round() as i32);
                                     if let Err(e) = lock_me.send_event(measure_event.clone()) {
                                         log::error!("Error sending event: {}", e);
@@ -281,9 +287,9 @@ impl MLX90393 {
         }
         thread::sleep(std::time::Duration::from_millis(2000));
 
-        self.set_gain(MLX90393GAIN::GAIN2X)?;
-        self.set_resolution(MLX90393AXIS::X, MLX90393RESOLUTION::RES17)?;
-        self.set_resolution(MLX90393AXIS::Y, MLX90393RESOLUTION::RES17)?;
+        self.set_gain(MLX90393GAIN::GAIN1X)?;
+        self.set_resolution(MLX90393AXIS::X, MLX90393RESOLUTION::RES19)?;
+        self.set_resolution(MLX90393AXIS::Y, MLX90393RESOLUTION::RES19)?;
         self.set_resolution(MLX90393AXIS::Z, MLX90393RESOLUTION::RES16)?;
         self.set_oversampling(MLX90393OVERSAMPLING::OSR3)?;
         self.set_filter(MLX90393FILTER::FILTER5)?;

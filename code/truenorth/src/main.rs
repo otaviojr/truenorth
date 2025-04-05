@@ -239,29 +239,6 @@ fn main() {
                 }
             }
         }
-        //if let Err(e) = mag.lock().unwrap().start_single_measurement() {
-        //    log::error!("Error starting single measurement: {}", e);
-        //}
-
-        /*thread::sleep(std::time::Duration::from_millis(1000));*/
-
-        /*if let Err(e) = motor.lock().unwrap().set_angle(0) {
-            log::error!("Error sending message: {}", e);
-        }
-        thread::sleep(std::time::Duration::from_secs(60));
-        if let Err(e) = motor.lock().unwrap().set_angle(90) {
-            log::error!("Error sending message: {}", e);
-        }
-        thread::sleep(std::time::Duration::from_secs(60));
-        if let Err(e) = motor.lock().unwrap().set_angle(180) {
-            log::error!("Error sending message: {}", e);
-        }
-        thread::sleep(std::time::Duration::from_secs(60));
-        
-        let angle = rand::thread_rng().gen_range(0..181);
-        if let Err(e) = motor.lock().unwrap().set_angle(angle) {
-            log::error!("Error sending message: {}", e);
-        }*/
         thread::sleep(std::time::Duration::from_millis(1000));
     }
 }

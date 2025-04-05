@@ -1,3 +1,4 @@
+use crate::math::Vector3;
 use std::time::Duration;
 
 pub mod mlx90393;
@@ -8,9 +9,9 @@ pub type MagSensorHandlerPtr = Box<dyn Fn(MagSensorEvent) -> () + Send>;
 
 #[derive(Debug, Clone, Copy)]
 pub enum MagSensorEvent {
-   RawChanged((f32, f32, f32)),
-   CalibratedChanged((f32,f32), (f32,f32), (f32,f32)),
-   HeadingChanged(i32),
+    RawChanged(Vector3),
+    CalibratedChanged((f32, f32), (f32, f32), (f32, f32)),
+    HeadingChanged(i32),
 }
 
 #[allow(unused)]
@@ -64,3 +65,4 @@ impl From<&str> for MagSensorState {
         }
     }
 }
+

@@ -1,16 +1,27 @@
-
 use core::f32;
-use std::{num::NonZero, sync::{Arc, Mutex}, thread, time::{Duration, Instant}};
+use std::{
+    num::NonZero,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
-use esp_idf_svc::hal::{gpio::{AnyIOPin, PinDriver, Pull, InterruptType}, i2c::{I2c, I2cDriver}, peripheral::Peripheral, units::Hertz};
 use esp_idf_svc::hal::task::notification::Notification;
-
-
-use crate::{magsensor::{MagSensor, MagSensorEvent, MagSensorState}, Endable, TrueNorthParameters};
-use crate::magsensor::mlx90393_defs::*;
-use crate::magsensor::mlx90393_inner::{MLX90393Inner, MLX90393Internal};
+use esp_idf_svc::hal::{
+    gpio::{AnyIOPin, InterruptType, PinDriver, Pull},
+    i2c::{I2c, I2cDriver},
+    peripheral::Peripheral,
+    units::Hertz,
+};
 
 use super::MagSensorHandlerPtr;
+use crate::magsensor::mlx90393_defs::*;
+use crate::magsensor::mlx90393_inner::{MLX90393Inner, MLX90393Internal};
+use crate::math::{LowPassFilter, Vector3};
+use crate::{
+    magsensor::{MagSensor, MagSensorEvent, MagSensorState},
+    Endable, TrueNorthParameters,
+};
 
 const CALIBRATION_SAMPLES: usize = 30;
 const MEASUREMENT_SAMPLES: usize = 100;
@@ -27,12 +38,23 @@ pub struct MLX90393Config {
 }
 
 impl MLX90393Config {
-    pub fn new(parameters: Arc<TrueNorthParameters>, slave_address: u8, sda: AnyIOPin, scl: AnyIOPin, int: AnyIOPin) -> Arc<Mutex<Self>> {
-        let me = Self { parameters, slave_address, sda, scl, int };
+    pub fn new(
+        parameters: Arc<TrueNorthParameters>,
+        slave_address: u8,
+        sda: AnyIOPin,
+        scl: AnyIOPin,
+        int: AnyIOPin,
+    ) -> Arc<Mutex<Self>> {
+        let me = Self {
+            parameters,
+            slave_address,
+            sda,
+            scl,
+            int,
+        };
         Arc::new(Mutex::new(me))
     }
 }
-
 
 pub struct MLX90393 {
     inner: Arc<Mutex<MLX90393Inner>>,
@@ -40,21 +62,24 @@ pub struct MLX90393 {
 
 impl MLX90393 {
     #[allow(dead_code)]
-    pub fn new(i2c: impl Peripheral<P = impl I2c> + 'static, config: Arc<Mutex<MLX90393Config>>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        i2c: impl Peripheral<P = impl I2c> + 'static,
+        config: Arc<Mutex<MLX90393Config>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let i2c = Self::init_i2c(i2c, config.clone())?;
-        
+
         let mut config = config.lock().unwrap();
 
-        let me = Self { 
-            inner: Arc::new(Mutex::new(MLX90393Inner { 
-                i2c: Some(i2c), 
+        let me = Self {
+            inner: Arc::new(Mutex::new(MLX90393Inner {
+                i2c: Some(i2c),
                 int: unsafe { config.int.clone_unchecked() },
-                slave_address: config.slave_address, 
+                slave_address: config.slave_address,
                 parameters: config.parameters.clone(),
                 internal: MLX90393Internal::default(),
             })),
         };
-        
+
         me.init()?;
 
         Ok(me)
@@ -64,9 +89,8 @@ impl MLX90393 {
         let shared_self = self.inner.clone();
 
         self.configure()?;
-    
+
         thread::Builder::new().spawn(move || {
-    
             let int = unsafe { shared_self.lock().unwrap().int.clone_unchecked() };
 
             let mut interrupt_pin = {
@@ -74,13 +98,18 @@ impl MLX90393 {
                     iopin
                 } else {
                     log::error!("Error setting up interruption");
-                    return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Error setting up interruption")));
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Error setting up interruption",
+                    )));
                 }
             };
-        
+
             interrupt_pin.set_pull(Pull::Down).unwrap();
-            interrupt_pin.set_interrupt_type(InterruptType::PosEdge).unwrap();
-        
+            interrupt_pin
+                .set_interrupt_type(InterruptType::PosEdge)
+                .unwrap();
+
             let notification = Notification::new();
             let waker = notification.notifier();
 
@@ -94,20 +123,15 @@ impl MLX90393 {
 
             //me.lock().unwrap().start_burst_measurement()?;
 
-            let mut pool_x = vec![];
-            let mut pool_y = vec![];
-            let mut pool_z = vec![];
-
-            let mut avg_x = 0.0;
-            let mut avg_y = 0.0;
-            let mut avg_z = 0.0;
+            let mut value = LowPassFilter::new(0.5);
+            let mut pool = vec![];
+            let mut avg = Vector3::new(0.0, 0.0, 0.0);
 
             let mut measure_event = MagSensorEvent::HeadingChanged(0);
 
             let mut current_time = Instant::now();
 
             'thread_loop: loop {
-
                 {
                     let lock_me = shared_self.lock().unwrap();
                     let lock_channel = lock_me.internal.channel.lock().unwrap();
@@ -124,10 +148,10 @@ impl MLX90393 {
                 if let Err(e) = interrupt_pin.enable_interrupt() {
                     log::error!("Error enabling interrupt: {}", e);
                 }
-        
+
                 if let Some(_ret) = notification.wait(100) {
                     let mut lock_me = shared_self.lock().unwrap();
-        
+
                     match lock_me.read_measurement() {
                         Ok(measurement) => {
                             //log::debug!("Measurement: {:?}", measurement);
@@ -135,44 +159,58 @@ impl MLX90393 {
                             let y = measurement[1];
                             let z = measurement[2];
 
-                            if current_time.elapsed().as_millis() > if lock_me.internal.state == MagSensorState::Calibrating { CALIBRATION_SAMPLE_TIME } else { MEASUREMENT_SAMPLE_TIME } {
-                                pool_x.push(x);
-                                pool_y.push(y);
-                                pool_z.push(z);
+                            if current_time.elapsed().as_millis()
+                                > if lock_me.internal.state == MagSensorState::Calibrating {
+                                    CALIBRATION_SAMPLE_TIME
+                                } else {
+                                    MEASUREMENT_SAMPLE_TIME
+                                }
+                            {
+                                pool.push(value.update(Vector3 { x, y, z }));
                                 current_time = Instant::now();
 
-                                if pool_x.len() > MEASUREMENT_SAMPLES {
-                                    pool_x.remove(0);
-                                    pool_y.remove(0);
-                                    pool_z.remove(0);
+                                if pool.len() > MEASUREMENT_SAMPLES {
+                                    pool.remove(0);
                                 }
 
-                                (avg_x, avg_y, avg_z) = {
+                                avg = {
                                     let mut sum_x = 0.0;
                                     let mut sum_y = 0.0;
                                     let mut sum_z = 0.0;
-    
-                                    let len = if lock_me.internal.state == MagSensorState::Calibrating { if pool_x.len() < CALIBRATION_SAMPLES { pool_x.len() } else { CALIBRATION_SAMPLES } } else { pool_x.len() };
-    
-                                    for i in pool_x.len()-len..pool_x.len() {
-                                        sum_x += pool_x[i];
-                                        sum_y += pool_y[i];
-                                        sum_z += pool_z[i];
+
+                                    let len =
+                                        if lock_me.internal.state == MagSensorState::Calibrating {
+                                            if pool.len() < CALIBRATION_SAMPLES {
+                                                pool.len()
+                                            } else {
+                                                CALIBRATION_SAMPLES
+                                            }
+                                        } else {
+                                            pool.len()
+                                        };
+
+                                    for i in pool.len() - len..pool.len() {
+                                        sum_x += pool[i].x;
+                                        sum_y += pool[i].y;
+                                        sum_z += pool[i].z;
                                     }
-    
-                                    (sum_x / len as f32, sum_y / len as f32, sum_z / len as f32)
+
+                                    Vector3 {
+                                        x: sum_x / len as f32,
+                                        y: sum_y / len as f32,
+                                        z: sum_z / len as f32,
+                                    }
                                 };
                             }
 
-
-                            let event = MagSensorEvent::RawChanged((avg_x, avg_y, avg_z));
+                            let event = MagSensorEvent::RawChanged(avg);
                             if let Err(e) = lock_me.send_event(event) {
                                 log::error!("Error sending event: {}", e);
                             }
 
                             let parameters = lock_me.parameters.clone();
-    
-                            let mut max_x = parameters.max_x.lock().unwrap(); 
+
+                            let mut max_x = parameters.max_x.lock().unwrap();
                             let mut min_x = parameters.min_x.lock().unwrap();
                             let mut max_y = parameters.max_y.lock().unwrap();
                             let mut min_y = parameters.min_y.lock().unwrap();
@@ -181,56 +219,62 @@ impl MLX90393 {
 
                             if lock_me.internal.state == MagSensorState::Calibrating {
                                 let mut changed = false;
-                                if avg_x > *max_x.get() {
-                                    if let Err(e) = max_x.set(avg_x) {
+                                if avg.x > *max_x.get() {
+                                    if let Err(e) = max_x.set(avg.x) {
                                         log::error!("Error setting max_x: {}", e);
                                     }
                                     changed = true;
                                 }
-                                if avg_x < *min_x.get() {
-                                    if let Err(e) = min_x.set(avg_x) {
+                                if avg.x < *min_x.get() {
+                                    if let Err(e) = min_x.set(avg.x) {
                                         log::error!("Error setting min_x: {}", e);
                                     }
                                     changed = true;
                                 }
-                                if avg_y > *max_y.get() {
-                                    if let Err(e) = max_y.set(avg_y) {
+                                if avg.y > *max_y.get() {
+                                    if let Err(e) = max_y.set(avg.y) {
                                         log::error!("Error setting max_y: {}", e);
                                     }
                                     changed = true;
                                 }
-                                if avg_y < *min_y.get() {
-                                    if let Err(e) = min_y.set(avg_y) {
+                                if avg.y < *min_y.get() {
+                                    if let Err(e) = min_y.set(avg.y) {
                                         log::error!("Error setting min_y: {}", e);
                                     }
                                     changed = true;
                                 }
-                                if avg_z > *max_z.get() {
-                                    if let Err(e) = max_z.set(avg_z) {
+                                if avg.z > *max_z.get() {
+                                    if let Err(e) = max_z.set(avg.z) {
                                         log::error!("Error setting max_z: {}", e);
                                     }
                                     changed = true;
                                 }
-                                if avg_z < *min_z.get() {
-                                    if let Err(e) = min_z.set(avg_z) {
+                                if avg.z < *min_z.get() {
+                                    if let Err(e) = min_z.set(avg.z) {
                                         log::error!("Error setting min_z: {}", e);
                                     }
                                     changed = true;
                                 }
 
                                 if changed {
-                                    let event = MagSensorEvent::CalibratedChanged((*max_x.get(), *min_x.get()), (*max_y.get(), *min_y.get()), (*max_z.get(), *min_z.get()));
+                                    let event = MagSensorEvent::CalibratedChanged(
+                                        (*max_x.get(), *min_x.get()),
+                                        (*max_y.get(), *min_y.get()),
+                                        (*max_z.get(), *min_z.get()),
+                                    );
+
                                     if let Err(e) = lock_me.send_event(event) {
                                         log::error!("Error sending event: {}", e);
                                     }
                                 }
-                            }
+                            } else if lock_me.internal.state == MagSensorState::Measuring {
+                                let calc_x =
+                                    (x + avg.x) / 2.0 - ((*max_x.get() + *min_x.get()) / 2.0);
+                                let calc_y =
+                                    (y + avg.y) / 2.0 - ((*max_y.get() + *min_y.get()) / 2.0);
 
-                            if lock_me.internal.state == MagSensorState::Measuring {
-                                let calc_x = (x+avg_x)/2.0 - ((*max_x.get() + *min_x.get())/2.0);
-                                let calc_y = (y+avg_y)/2.0 - ((*max_y.get() + *min_y.get())/2.0);
-
-                                let mut heading =  (calc_x.atan2(calc_y) * 180.0) / std::f32::consts::PI;
+                                let mut heading =
+                                    (calc_x.atan2(calc_y) * 180.0) / std::f32::consts::PI;
 
                                 if heading < 0.0 {
                                     heading = heading + 360.0;
@@ -249,7 +293,8 @@ impl MLX90393 {
                                 };
 
                                 if diff > 2 {
-                                    measure_event = MagSensorEvent::HeadingChanged(heading.round() as i32);
+                                    measure_event =
+                                        MagSensorEvent::HeadingChanged(heading.round() as i32);
                                     if let Err(e) = lock_me.send_event(measure_event.clone()) {
                                         log::error!("Error sending event: {}", e);
                                     }
@@ -259,7 +304,7 @@ impl MLX90393 {
                         Err(e) => log::error!("Error reading measurement: {}", e),
                     }
                 }
-            };
+            }
 
             log::info!("MLX90393: thread ended");
             Ok(())
@@ -268,7 +313,10 @@ impl MLX90393 {
         Ok(())
     }
 
-    fn init_i2c(i2c: impl Peripheral<P = impl I2c> + 'static, config: Arc<Mutex<MLX90393Config>>) -> Result<I2cDriver<'static>, Box<dyn std::error::Error>> {
+    fn init_i2c(
+        i2c: impl Peripheral<P = impl I2c> + 'static,
+        config: Arc<Mutex<MLX90393Config>>,
+    ) -> Result<I2cDriver<'static>, Box<dyn std::error::Error>> {
         let sda = unsafe { config.lock().unwrap().sda.clone_unchecked() };
         let scl = unsafe { config.lock().unwrap().scl.clone_unchecked() };
         let config = esp_idf_hal::i2c::I2cConfig::new().baudrate(Hertz(100000));
@@ -282,7 +330,7 @@ impl MLX90393 {
             log::warn!("Error exiting mode: {}", e);
         }
         thread::sleep(std::time::Duration::from_millis(100));
-        if let Err(e) = self.reset(){
+        if let Err(e) = self.reset() {
             log::warn!("Error resetting magnetometer: {}", e);
         }
         thread::sleep(std::time::Duration::from_millis(2000));
@@ -301,7 +349,11 @@ impl MLX90393 {
         self.inner.lock().unwrap().read_register(register)
     }
 
-    pub fn write_register(&self, register: MLX90393REG, value: u16) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn write_register(
+        &self,
+        register: MLX90393REG,
+        value: u16,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.inner.lock().unwrap().write_register(register, value)
     }
 
@@ -317,11 +369,21 @@ impl MLX90393 {
         self.inner.lock().unwrap().get_gain()
     }
 
-    pub fn set_resolution(&self, axis: MLX90393AXIS, new_resolution: MLX90393RESOLUTION) -> Result<(), Box<dyn std::error::Error>> {
-        self.inner.lock().unwrap().set_resolution(axis, new_resolution)
+    pub fn set_resolution(
+        &self,
+        axis: MLX90393AXIS,
+        new_resolution: MLX90393RESOLUTION,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_resolution(axis, new_resolution)
     }
 
-    pub fn get_resolution(&self, axis: MLX90393AXIS) -> Result<MLX90393RESOLUTION, Box<dyn std::error::Error>> {
+    pub fn get_resolution(
+        &self,
+        axis: MLX90393AXIS,
+    ) -> Result<MLX90393RESOLUTION, Box<dyn std::error::Error>> {
         self.inner.lock().unwrap().get_resolution(axis)
     }
 
@@ -333,8 +395,14 @@ impl MLX90393 {
         self.inner.lock().unwrap().get_filter()
     }
 
-    pub fn set_oversampling(&self, new_oversampling: MLX90393OVERSAMPLING) -> Result<(), Box<dyn std::error::Error>> {
-        self.inner.lock().unwrap().set_oversampling(new_oversampling)
+    pub fn set_oversampling(
+        &self,
+        new_oversampling: MLX90393OVERSAMPLING,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_oversampling(new_oversampling)
     }
 
     pub fn get_oversampling(&self) -> Result<MLX90393OVERSAMPLING, Box<dyn std::error::Error>> {
@@ -363,7 +431,7 @@ impl MLX90393 {
 
     pub fn reset(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.inner.lock().unwrap().reset()
-    }    
+    }
 }
 
 impl MagSensor for MLX90393 {

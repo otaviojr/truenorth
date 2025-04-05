@@ -3,6 +3,8 @@
 pub mod motor;
 pub mod smartvar;
 pub mod magsensor;
+pub mod math;
+
 use crate::motor::Motor;
 use crate::smartvar::SmartVar;
 
@@ -140,7 +142,7 @@ fn main() {
             MagSensorEvent::HeadingChanged(heading) => {
                 log::debug!("Heading: {:?}", heading);
             },
-            MagSensorEvent::RawChanged((_x, _y, _z)) => {}
+            MagSensorEvent::RawChanged(_reading) => {}
         }
     })) {
         log::error!("Error adding handler: {}", err);
